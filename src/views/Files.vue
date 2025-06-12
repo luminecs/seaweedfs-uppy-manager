@@ -30,7 +30,13 @@
           <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{ file.Key }}</td>
           <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ formatBytes(file.Size) }}</td>
           <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ new Date(file.LastModified).toLocaleString() }}</td>
-          <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+          <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-4">
+            <button @click="handlePreview(file.Key)" class="text-indigo-600 hover:text-indigo-900">
+              Preview
+            </button>
+            <button @click="handleDownload(file.Key)" class="text-green-600 hover:text-green-900">
+              Download
+            </button>
             <button @click="deleteFile(file.Key)" class="text-red-600 hover:text-red-800 disabled:text-gray-400" :disabled="loading.delete === file.Key">
               <span v-if="loading.delete === file.Key">Deleting...</span>
               <span v-else>Delete</span>
@@ -55,6 +61,7 @@ import {
   AbortMultipartUploadCommand,
   UploadPartCommand,
   PutObjectCommand,
+  GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -112,6 +119,69 @@ const formatBytes = (bytes, decimals = 2) => {
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
+
+/**
+ * 生成用于 GET 操作的预签名 URL。
+ * 这是一个可复用的辅助函数。
+ * @param {string} key - 文件名
+ * @returns {Promise<string>} - 预签名 URL
+ */
+async function getPresignedGetUrl(key) {
+  try {
+    const command = new GetObjectCommand({
+      Bucket: props.bucketName,
+      Key: key,
+    });
+    // URL 有效期 15 分钟，对于预览和下载足够了
+    const url = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+    return url;
+  } catch (err) {
+    console.error(`Failed to get presigned URL for ${key}`, err);
+    alert(`Could not generate URL for ${key}. See console for details.`);
+    throw err;
+  }
+}
+
+/**
+ * 处理文件预览
+ * @param {string} key - 文件名
+ */
+async function handlePreview(key) {
+  console.log(`Requesting preview for: ${key}`);
+  try {
+    const url = await getPresignedGetUrl(key);
+    // 在新标签页打开 URL
+    window.open(url, '_blank');
+  } catch (err) {
+    // 错误已在 getPresignedGetUrl 中处理
+  }
+}
+
+/**
+ * 处理文件下载
+ * @param {string} key - 文件名
+ */
+async function handleDownload(key) {
+  console.log(`Requesting download for: ${key}`);
+  try {
+    const url = await getPresignedGetUrl(key);
+
+    // 创建一个隐藏的 a 标签来触发下载
+    const link = document.createElement('a');
+    link.href = url;
+
+    // 设置 download 属性，浏览器会使用这个值作为默认文件名
+    link.setAttribute('download', key);
+
+    // 将 a 标签添加到文档中，模拟点击，然后移除
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+  } catch (err) {
+    // 错误已在 getPresignedGetUrl 中处理
+  }
+}
 
 onMounted(() => {
   // 核心修正 1：先同步创建 Uppy 实例，再执行异步操作
