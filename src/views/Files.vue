@@ -55,7 +55,7 @@ import {
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
   UploadPartCommand,
-  PutObjectCommand, // <-- 导入用于单文件上传的命令
+  PutObjectCommand, // <-- 用于单文件上传
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -75,11 +75,13 @@ const loading = reactive({ list: false, delete: null });
 const error = reactive({ list: null });
 const uppy = ref(null);
 
+// ... formatBytes, deleteFile, fetchFiles 函数保持不变 ...
 async function fetchFiles() {
   loading.list = true;
   error.list = null;
   try {
     const { Contents } = await s3Client.send(new ListObjectsV2Command({ Bucket: props.bucketName }));
+    // 确保刷新时按时间倒序排列
     files.value = (Contents || []).sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
   } catch (e) {
     error.list = `Failed to fetch files: ${e.message}`;
@@ -88,7 +90,6 @@ async function fetchFiles() {
     loading.list = false;
   }
 }
-
 async function deleteFile(key) {
   if (!confirm(`Are you sure you want to delete the file "${key}"?`)) {
     return;
@@ -104,9 +105,8 @@ async function deleteFile(key) {
     loading.delete = null;
   }
 }
-
 const formatBytes = (bytes, decimals = 2) => {
-  if (!bytes) return '0 Bytes';
+  if (!bytes || bytes === 0) return '0 Bytes';
   const k = 1024;
   const dm = decimals < 0 ? 0 : decimals;
   const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
@@ -121,107 +121,141 @@ onMounted(() => {
   uppy.value = new Uppy({
     autoProceed: true,
     debug: true,
-    // 可选：设置分片大小，让测试更容易触发分片逻辑
-    // chunkSize: 5 * 1024 * 1024, // 5MB
+    // 明确设置最小分片大小，例如 10MB，以确保大文件走分片
+    restrictions: {
+      minPartSize: 10 * 1024 * 1024,
+    }
   }).use(AwsS3Multipart, {
-    // 1. 创建分片上传事务 (只对大文件调用)
-    createMultipartUpload: async (file) => {
-      console.log('Creating multipart upload for:', file.name);
-      const command = new CreateMultipartUploadCommand({
-        Bucket: props.bucketName,
-        Key: file.name,
-        ContentType: file.type,
-      });
-      const data = await s3Client.send(command);
-      return { uploadId: data.UploadId, key: data.Key };
-    },
+    // 设置并发上传的分片数量，避免过多请求
+    limit: 5,
 
-    // 2. 为上传获取参数 (对小文件和每个分片都会调用)
-    getUploadParameters: async (file, partData) => {
-      // 核心修正：判断是分片上传还是单文件上传
-      if (partData.uploadId) {
-        // --- 这是分片上传 ---
-        const { number, uploadId } = partData;
-        console.log(`Getting presigned URL for PART: ${number} of ${file.name}`);
-        const command = new UploadPartCommand({
-          Bucket: props.bucketName,
-          Key: file.name,
-          PartNumber: number,
-          UploadId: uploadId,
-        });
-        const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 }); // 15分钟
-        return { method: 'PUT', url: presignedUrl, fields: {}, headers: {} };
-
-      } else {
-        // --- 这是单文件上传 ---
-        console.log(`Getting presigned URL for SINGLE FILE: ${file.name}`);
+    // ======  非分片上传（小文件） ======
+    // 只接收 file 参数
+    getUploadParameters: async (file) => {
+      console.log(`[Non-Multipart] Getting presigned URL for SINGLE FILE: ${file.name}`);
+      try {
         const command = new PutObjectCommand({
           Bucket: props.bucketName,
           Key: file.name,
           ContentType: file.type,
+          // ContentLength: file.size // 可选
         });
         const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 }); // 15分钟
         return { method: 'PUT', url: presignedUrl, fields: {}, headers: {} };
+      } catch(e) {
+        console.error(`[Non-Multipart] Error:`, e);
+        throw e;
       }
     },
 
-    // 3. 完成上传 (只对大文件调用)
-    completeMultipartUpload: async (file, { uploadId, key, parts }) => {
-      console.log('Completing multipart upload for:', file.name);
-      const command = new CompleteMultipartUploadCommand({
-        Bucket: props.bucketName,
-        Key: key,
-        UploadId: uploadId,
-        MultipartUpload: { Parts: parts },
-      });
-      const data = await s3Client.send(command);
-      return { location: data.Location };
+    // ====== 分片上传（大文件） ======
+    // 1. 开始
+    createMultipartUpload: async (file) => {
+      console.log('[Multipart] Creating for:', file.name);
+      try {
+        const command = new CreateMultipartUploadCommand({
+          Bucket: props.bucketName,
+          Key: file.name,
+          ContentType: file.type,
+        });
+        const data = await s3Client.send(command);
+        return { uploadId: data.UploadId, key: data.Key };
+      } catch(e) {
+        console.error(`[Multipart] Create Error:`, e);
+        throw e;
+      }
     },
 
-    // 4. 中止上传 (只对大文件调用)
-    abortMultipartUpload: async (file, { uploadId, key }) => {
-      console.log('Aborting multipart upload for:', file.name);
-      const command = new AbortMultipartUploadCommand({
-        Bucket: props.bucketName,
-        Key: key,
-        UploadId: uploadId,
-      });
-      await s3Client.send(command);
+    // 2. 核心：为每个分片签名 (代替了 getUploadParameters 的分片逻辑)
+    signPart: async (file, { uploadId, partNumber, key, body, signal }) => {
+      console.log(`[Multipart] Signing PART: ${partNumber} for ${file.name}`);
+      try {
+        const command = new UploadPartCommand({
+          Bucket: props.bucketName,
+          Key: key, // 使用 create 返回的 key
+          UploadId: uploadId,
+          PartNumber: partNumber,
+          // Body: body, // 不要在这里传Body，让 Uppy 自己去PUT
+          // ContentLength: body.size // 确保签名时包含长度
+        });
+        const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+        // signPart 期望返回 { url: '...' }
+        return { url: presignedUrl };
+      } catch(e) {
+        console.error(`[Multipart] SignPart ${partNumber} Error:`, e);
+        throw e;
+      }
     },
+
+    // 3. 完成
+    completeMultipartUpload: async (file, { uploadId, key, parts }) => {
+      console.log('[Multipart] Completing for:', file.name, 'Parts:', parts.length);
+      try {
+        // 确保 parts 按 PartNumber 排序，S3 API 要求
+        const sortedParts = parts.sort((a, b) => a.PartNumber - b.PartNumber);
+        const command = new CompleteMultipartUploadCommand({
+          Bucket: props.bucketName,
+          Key: key,
+          UploadId: uploadId,
+          MultipartUpload: { Parts: sortedParts },
+        });
+        const data = await s3Client.send(command);
+        return { location: data.Location };
+      } catch(e) {
+        console.error(`[Multipart] Complete Error:`, e);
+        throw e;
+      }
+    },
+
+    // 4. 中止
+    abortMultipartUpload: async (file, { uploadId, key }) => {
+      console.log('[Multipart] Aborting for:', file.name);
+      try {
+        const command = new AbortMultipartUploadCommand({
+          Bucket: props.bucketName,
+          Key: key,
+          UploadId: uploadId,
+        });
+        await s3Client.send(command);
+      }  catch(e) {
+        console.error(`[Multipart] Abort Error:`, e);
+        throw e;
+      }
+    },
+    // listParts: 可以不提供，除非要实现复杂的断点续传
   });
 
-  // 监听单个文件上传成功事件
+  // --- 刷新逻辑 ---
   uppy.value.on('upload-success', (file, response) => {
     console.log(`${file.name} uploaded successfully!`);
-
-    // 乐观更新UI：立即将新文件添加到列表顶部，提供即时反馈
-    // 注意：这里的 size 和 lastModified 是估算的，会被后续的 fetchFiles 更新
     const newFile = {
       Key: file.name,
       Size: file.size,
-      LastModified: new Date().toISOString(), // 使用当前时间
+      LastModified: new Date().toISOString(),
     };
-    files.value.unshift(newFile); // 添加到数组开头
-
-    // 可以在稍后调用 fetchFiles 来确保数据完全同步
-    // 但为了更好的用户体验，可以等待 complete 事件或只依赖乐观更新
+    // 检查是否已存在，避免乐观更新和刷新时的重复
+    if (!files.value.some(f => f.Key === newFile.Key)) {
+      files.value.unshift(newFile);
+      // 保持排序
+      files.value.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+    }
   });
 
-  // 监听所有文件处理完成的事件
   uppy.value.on('complete', (result) => {
-    console.log('All uploads complete, refreshing list from server.');
-    if (result.successful.length > 0) {
-      // 延迟一段时间以确保后端数据一致性
+    console.log('All uploads complete, queueing refresh...');
+    if (result.successful.length > 0 || result.failed.length > 0) {
+      // 无论成功失败，只要有操作就刷新
       setTimeout(() => {
-        fetchFiles();
-      }, 1500); // 这里的延迟现在是作为最终同步，可以适当调整
+        console.log('Refreshing list from server now.');
+        fetchFiles(); // 确保 fetchFiles 内部有排序
+      }, 2000); // 增加延迟到2秒
     }
     if (result.failed.length > 0) {
       console.error('Some uploads failed:', result.failed);
-      // 如果有失败，也最好刷新一下列表，以防有部分成功的文件
-      fetchFiles();
     }
   });
+  // --- 刷新逻辑 End ---
+
 });
 
 onUnmounted(() => {
