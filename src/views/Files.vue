@@ -30,7 +30,7 @@
           <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{ file.Key }}</td>
           <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ formatBytes(file.Size) }}</td>
           <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ new Date(file.LastModified).toLocaleString() }}</td>
-          <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-4">
+          <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-3">
             <button @click="handlePreview(file.Key)" class="text-indigo-600 hover:text-indigo-900">
               Preview
             </button>
@@ -62,12 +62,14 @@ import {
   UploadPartCommand,
   PutObjectCommand,
   GetObjectCommand,
+  ListPartsCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 import { Dashboard } from '@uppy/vue';
 import Uppy from '@uppy/core';
 import AwsS3Multipart from '@uppy/aws-s3-multipart';
+import GoldenRetriever from '@uppy/golden-retriever'; // <-- 导入 Golden Retriever
 
 const props = defineProps({
   bucketName: {
@@ -120,19 +122,12 @@ const formatBytes = (bytes, decimals = 2) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 };
 
-/**
- * 生成用于 GET 操作的预签名 URL。
- * 这是一个可复用的辅助函数。
- * @param {string} key - 文件名
- * @returns {Promise<string>} - 预签名 URL
- */
 async function getPresignedGetUrl(key) {
   try {
     const command = new GetObjectCommand({
       Bucket: props.bucketName,
       Key: key,
     });
-    // URL 有效期 15 分钟，对于预览和下载足够了
     const url = await getSignedUrl(s3Client, command, { expiresIn: 900 });
     return url;
   } catch (err) {
@@ -142,120 +137,87 @@ async function getPresignedGetUrl(key) {
   }
 }
 
-/**
- * 处理文件预览
- * @param {string} key - 文件名
- */
 async function handlePreview(key) {
-  console.log(`Requesting preview for: ${key}`);
   try {
     const url = await getPresignedGetUrl(key);
-    // 在新标签页打开 URL
     window.open(url, '_blank');
   } catch (err) {
-    // 错误已在 getPresignedGetUrl 中处理
+    // Error is handled in getPresignedGetUrl
   }
 }
 
-/**
- * 处理文件下载
- * @param {string} key - 文件名
- */
 async function handleDownload(key) {
-  console.log(`Requesting download for: ${key}`);
   try {
     const url = await getPresignedGetUrl(key);
-
-    // 创建一个隐藏的 a 标签来触发下载
     const link = document.createElement('a');
     link.href = url;
-
-    // 设置 download 属性，浏览器会使用这个值作为默认文件名
     link.setAttribute('download', key);
-
-    // 将 a 标签添加到文档中，模拟点击，然后移除
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-
   } catch (err) {
-    // 错误已在 getPresignedGetUrl 中处理
+    // Error is handled in getPresignedGetUrl
   }
 }
 
 onMounted(() => {
-  // 核心修正 1：先同步创建 Uppy 实例，再执行异步操作
   try {
     uppy.value = new Uppy({
-      autoProceed: true,
+      autoProceed: false,
       debug: true,
       restrictions: {
         minPartSize: 10 * 1024 * 1024,
       }
-    }).use(AwsS3Multipart, {
-      limit: 5,
-      getUploadParameters: async (file) => {
-        console.log(`[Non-Multipart] Getting presigned URL for SINGLE FILE: ${file.name}`);
-        const command = new PutObjectCommand({
-          Bucket: props.bucketName,
-          Key: file.name,
-          ContentType: file.type,
-        });
-        const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
-        return { method: 'PUT', url: presignedUrl, fields: {}, headers: {} };
-      },
-      createMultipartUpload: async (file) => {
-        console.log('[Multipart] Creating for:', file.name);
-        const command = new CreateMultipartUploadCommand({
-          Bucket: props.bucketName,
-          Key: file.name,
-          ContentType: file.type,
-        });
-        const data = await s3Client.send(command);
-        return { uploadId: data.UploadId, key: data.Key };
-      },
-      signPart: async (file, { uploadId, partNumber, key }) => {
-        console.log(`[Multipart] Signing PART: ${partNumber} for ${file.name}`);
-        const command = new UploadPartCommand({
-          Bucket: props.bucketName,
-          Key: key,
-          UploadId: uploadId,
-          PartNumber: partNumber,
-        });
-        const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
-        return { url: presignedUrl };
-      },
-      completeMultipartUpload: async (file, { uploadId, key, parts }) => {
-        console.log('[Multipart] Completing for:', file.name, 'Parts:', parts.length);
-        const sortedParts = parts.sort((a, b) => a.PartNumber - b.PartNumber);
-        const command = new CompleteMultipartUploadCommand({
-          Bucket: props.bucketName,
-          Key: key,
-          UploadId: uploadId,
-          MultipartUpload: { Parts: sortedParts },
-        });
-        const data = await s3Client.send(command);
-        return { location: data.Location };
-      },
-      abortMultipartUpload: async (file, { uploadId, key }) => {
-        console.log('[Multipart] Aborting for:', file.name);
-        const command = new AbortMultipartUploadCommand({
-          Bucket: props.bucketName,
-          Key: key,
-          UploadId: uploadId,
-        });
-        await s3Client.send(command);
-      },
-    });
+    })
+      // 官方续传插件，自动处理 localStorage 和状态恢复
+      .use(GoldenRetriever, { expires: 24 * 60 * 60 * 1000 }) // 缓存24小时
+      // S3 分片插件 (必须在 GoldenRetriever 之后)
+      .use(AwsS3Multipart, {
+        limit: 5,
+        // 小文件上传
+        getUploadParameters: async (file) => {
+          console.log(`[Non-Multipart] Getting presigned URL for SINGLE FILE: ${file.name}`);
+          const command = new PutObjectCommand({ Bucket: props.bucketName, Key: file.name, ContentType: file.type });
+          const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+          return { method: 'PUT', url: presignedUrl, fields: {}, headers: {} };
+        },
+        // 大文件分片上传流程
+        createMultipartUpload: async (file) => {
+          console.log('[Multipart] Creating for:', file.name);
+          const command = new CreateMultipartUploadCommand({ Bucket: props.bucketName, Key: file.name, ContentType: file.type });
+          const data = await s3Client.send(command);
+          return { uploadId: data.UploadId, key: data.Key };
+        },
+        signPart: async (file, { uploadId, partNumber, key }) => {
+          console.log(`[Multipart] Signing PART: ${partNumber} for ${file.name}`);
+          const command = new UploadPartCommand({ Bucket: props.bucketName, Key: key, UploadId: uploadId, PartNumber: partNumber });
+          const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+          return { url: presignedUrl };
+        },
+        listParts: async (file, { uploadId, key }) => {
+          console.log(`[Multipart] Listing parts for: ${file.name}`);
+          const command = new ListPartsCommand({ Bucket: props.bucketName, Key: key, UploadId: uploadId });
+          const data = await s3Client.send(command);
+          return data.Parts || [];
+        },
+        completeMultipartUpload: async (file, { uploadId, key, parts }) => {
+          console.log('[Multipart] Completing for:', file.name);
+          const sortedParts = parts.sort((a, b) => a.PartNumber - b.PartNumber);
+          const command = new CompleteMultipartUploadCommand({ Bucket: props.bucketName, Key: key, UploadId: uploadId, MultipartUpload: { Parts: sortedParts } });
+          const data = await s3Client.send(command);
+          return { location: data.Location };
+        },
+        abortMultipartUpload: async (file, { uploadId, key }) => {
+          console.log('[Multipart] Aborting for:', file.name);
+          const command = new AbortMultipartUploadCommand({ Bucket: props.bucketName, Key: key, UploadId: uploadId });
+          await s3Client.send(command);
+        },
+      });
 
-    // 绑定事件监听器
-    uppy.value.on('upload-success', (file, response) => {
+    // --- UI 刷新逻辑 ---
+    uppy.value.on('upload-success', (file) => {
       console.log(`${file.name} uploaded successfully!`);
-      const newFile = {
-        Key: file.name,
-        Size: file.size,
-        LastModified: new Date().toISOString(),
-      };
+      const newFile = { Key: file.name, Size: file.size, LastModified: new Date().toISOString() };
       if (!files.value.some(f => f.Key === newFile.Key)) {
         files.value.unshift(newFile);
         files.value.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
@@ -270,28 +232,23 @@ onMounted(() => {
           fetchFiles();
         }, 2000);
       }
-      if (result.failed.length > 0) {
-        console.error('Some uploads failed:', result.failed);
-      }
     });
+    // --- UI 刷新逻辑结束 ---
 
   } catch (e) {
     console.error("Failed to initialize Uppy:", e);
     error.list = "Uppy uploader failed to initialize.";
   }
 
-  // 最后再执行异步的数据获取
   fetchFiles();
 });
 
 onUnmounted(() => {
-  console.log('Files.vue is being unmounted. Attempting to close Uppy.');
-  // 核心修正 2：增加更健壮的检查
   if (uppy.value && typeof uppy.value.close === 'function') {
     try {
       uppy.value.close();
       console.log('Uppy instance closed successfully.');
-      uppy.value = null; // 手动置空，帮助垃圾回收
+      uppy.value = null;
     } catch (e) {
       console.error('An error occurred while closing Uppy:', e);
     }
