@@ -6,12 +6,12 @@ import Files from '../views/Files.vue';
 
 const routes = [
   {
-    path: '/',
+    path: '/Upload',
     name: 'Upload',
     component: Upload,
   },
   {
-    path: '/buckets',
+    path: '/',
     name: 'Buckets',
     component: Buckets,
   },
